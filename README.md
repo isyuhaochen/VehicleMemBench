@@ -1,4 +1,14 @@
-# VehicleMemBench: An Executable Benchmark for Multi-User Long-Term Memory in In-Vehicle Agents
+<div align="center">
+
+# 🚗 VehicleMemBench
+### An Executable Benchmark for Multi-User Long-Term Memory in In-Vehicle Agents
+
+
+[**📖 Paper**](https://arxiv.org/abs/xxxx.xxxx) | [**🚀 GitHub**](https://github.com/isyuhaochen/VehicleMemBench) | [**🤗 Dataset**](https://huggingface.co/datasets/callalilya/VehicleMemBench)
+
+</div>
+
+---
 
 Official codebase of **VehicleMemBench**, a benchmark for evaluating whether agents can recover multi-user preferences from long interaction histories, resolve preference conflicts, and invoke vehicle tools to reach the correct final environment state.
 
