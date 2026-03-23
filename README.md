@@ -18,23 +18,32 @@ Official codebase of **VehicleMemBench**, a benchmark for evaluating whether age
 
 ### A. Model Evaluation
 
-This setting evaluates the backbone model under different memory constructions such as:
+This setting evaluates the backbone model under basic memory constructions, such as:
 
-- `none`
-- `gold`
-- `summary`
-- `key_value`
+- Raw History (`none`): Gives the entire interaction history as plain text to evaluate native long-context processing.
+- Gold Memory (`gold`): Provides ground-truth latest user preferences directly, representing the theoretical performance upper bound.
+- Recursive Summarization (`summary`): Compresses history into hierarchical summaries to test reasoning over distilled information.
+- Key-Value Store (`key_value`): Organizes preferences into structured attribute-value pairs to assess precise, indexed retrieval.
 
 ### B. Memory-System Evaluation
 
-This setting first ingests dialogue history into a memory system and then evaluates whether the agent can retrieve useful memory and execute the correct vehicle actions.
+This setting first ingests dialogue history into a memory system and then evaluates whether the agent can retrieve useful memory and execute the correct vehicle actions. The evaluated memory systems include:
 
+- Gold Memory
+- Recursive Summarization
+- Key-Value Store
+- [Memobase](https://github.com/memodb-io/memobase)
+- [LightMem](https://github.com/zjunlp/LightMem)
+- [Mem0](https://github.com/mem0ai/mem0)
+- [MemOS](https://github.com/MemTensor/MemOS)
+- [Supermemory](https://github.com/supermemoryai/supermemory)
+
+### C. Evaluation Metrics
 Main metrics used in this repo include:
 
-- `Exact State Match`
-- field-level and value-level metrics
-- average prediction/tool-call statistics
-- output token statistics
+- Exact State Match: A strict binary success metric that requires the final environment state of models to perfectly match the ground truth.
+- Field- and Value-level Metrics: Fine-grained Precision, Recall, and F1 scores that assess whether the correct system fields were modified and if their values were predicted accurately.
+- Average Prediction/Tool-call Statistics: The average number of tool calls that measures the execution cost and system overhead per task.
 
 ## 🗂️ Repository Structure
 
