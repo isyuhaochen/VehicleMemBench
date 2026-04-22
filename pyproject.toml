@@ -1,0 +1,19 @@
+[project]
+name = "vehiclemembench"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "openai>=1.0.0",
+    "pandas>=2.0.0",
+    "openpyxl>=3.1.0",
+    "tqdm>=4.66.0",
+    "numpy>=1.26.0",
+    "tiktoken>=0.7.0",
+    "sentence-transformers>=2.7.0",
+    "mem0ai>=1.0.7",
+    "supermemory>=3.30.1",
+    "memobase>=0.0.27",
+    "lightmem>=0.0.0",
+]

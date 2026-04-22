@@ -1,4 +1,4 @@
-from . import lightmem, mem0, memobase, memos, supermemory
+from . import lightmem, mem0, memobase, memorybank, memos, supermemory
 
 
 SYSTEM_MODULES = {
@@ -7,6 +7,7 @@ SYSTEM_MODULES = {
     "lightmem": lightmem,
     "supermemory": supermemory,
     "memobase": memobase,
+    "memorybank": memorybank,
 }
 
 SUPPORTED_MEMORY_SYSTEMS = tuple(SYSTEM_MODULES.keys())
