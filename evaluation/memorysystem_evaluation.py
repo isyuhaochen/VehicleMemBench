@@ -614,6 +614,7 @@ def memorysystem_add(
     embedding_api_base: Optional[str] = None,
     embedding_api_key: Optional[str] = None,
     embedding_model: Optional[str] = None,
+    store_root: Optional[str] = None,
 ) -> None:
     memory_module = get_system_module(memory_system)
     args = argparse.Namespace(
@@ -629,6 +630,7 @@ def memorysystem_add(
         embedding_api_base=embedding_api_base,
         embedding_api_key=embedding_api_key,
         embedding_model=embedding_model,
+        store_root=store_root,
     )
     memory_module.validate_add_args(args)
     memory_module.run_add(args)
@@ -658,6 +660,7 @@ def memorysystem_evaluation(
     embedding_api_key: Optional[str] = None,
     embedding_model: Optional[str] = None,
     history_dir: Optional[str] = None,
+    store_root: Optional[str] = None,
 ) -> None:
     runtime = _get_runtime_helpers()
     AgentClient = runtime["AgentClient"]
@@ -687,6 +690,7 @@ def memorysystem_evaluation(
         embedding_api_key=embedding_api_key,
         embedding_model=embedding_model,
         history_dir=history_dir or os.path.join(ROOT_DIR, "benchmark", "history"),
+        store_root=store_root,
     )
     memory_module.validate_test_args(args)
 
@@ -876,6 +880,7 @@ def memorysystem_evaluation(
         "enable_graph": enable_graph,
         "user_id_prefix": user_id_prefix,
         "max_workers": max_workers,
+        "store_root": getattr(args, "store_root", None) or store_root,
     }
     save_json_file(config, os.path.join(output_subdir, "config.json"))
 
@@ -911,6 +916,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     add_parser.add_argument("--embedding_api_base", type=str, default=None, help="MemoryBank embedding API base URL")
     add_parser.add_argument("--embedding_api_key", type=str, default=None, help="MemoryBank embedding API key")
     add_parser.add_argument("--embedding_model", type=str, default=None, help="MemoryBank embedding model name")
+    add_parser.add_argument("--store_root", type=str, default=None, help="MemoryBank FAISS store root directory")
 
     test_parser = subparsers.add_parser(
         "test",
@@ -946,6 +952,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     test_parser.add_argument("--embedding_api_key", type=str, default=None, help="MemoryBank embedding API key")
     test_parser.add_argument("--embedding_model", type=str, default=None, help="MemoryBank embedding model name")
     test_parser.add_argument("--history_dir", type=str, default=None, help="History data directory (for MemoryBank reference date)")
+    test_parser.add_argument("--store_root", type=str, default=None, help="MemoryBank FAISS store root directory")
     test_parser.add_argument(
         "--enable_thinking",
         type=str2bool,
@@ -974,6 +981,7 @@ if __name__ == "__main__":
             embedding_api_base=cli_args.embedding_api_base,
             embedding_api_key=cli_args.embedding_api_key,
             embedding_model=cli_args.embedding_model,
+            store_root=cli_args.store_root,
         )
     else:
         memorysystem_evaluation(
@@ -999,4 +1007,5 @@ if __name__ == "__main__":
             embedding_api_key=cli_args.embedding_api_key,
             embedding_model=cli_args.embedding_model,
             history_dir=cli_args.history_dir,
+            store_root=cli_args.store_root,
         )

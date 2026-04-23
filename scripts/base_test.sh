@@ -145,14 +145,18 @@ for MEMORY_TYPE in "${SELECTED_TYPES[@]}"; do
 done
 
 if [[ "$USE_MEMORYBANK" == true ]]; then
-  MB_PREFIX="${PREFIX}_memorybank"
+  MB_PREFIX="${PREFIX}_think_memorybank"
+  MODEL_SAFE="${MODEL//\//_}"
+  SESSION_TS=$(date +%Y%m%d_%H%M%S)
+  MB_STORE_ROOT="${ROOT_DIR}/log/${MB_PREFIX}_${MODEL_SAFE}_${SESSION_TS}"
 
-  echo "=== Running memorybank add stage ==="
+  echo "=== Running memorybank add stage (store_root=${MB_STORE_ROOT}) ==="
   uv run memorysystem_evaluation.py add \
     --memory_system memorybank \
     --history_dir "$HISTORY_DIR" \
     --file_range "$FILE_RANGE" \
     --max_workers 3 \
+    --store_root "$MB_STORE_ROOT" \
     --embedding_api_base "$EMBEDDING_API_BASE" \
     --embedding_api_key "$EMBEDDING_API_KEY" \
     --embedding_model "$EMBEDDING_MODEL"
@@ -167,6 +171,8 @@ if [[ "$USE_MEMORYBANK" == true ]]; then
     --enable_thinking true \
     --reflect_num 10 \
     --max_workers 3 \
+    --output_dir "${ROOT_DIR}/log" \
+    --store_root "$MB_STORE_ROOT" \
     --embedding_api_base "$EMBEDDING_API_BASE" \
     --embedding_api_key "$EMBEDDING_API_KEY" \
     --embedding_model "$EMBEDDING_MODEL"
