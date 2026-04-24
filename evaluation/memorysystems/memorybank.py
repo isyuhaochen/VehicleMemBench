@@ -1,4 +1,3 @@
-import hashlib
 import json
 import math
 import os
@@ -24,16 +23,12 @@ from .common import (
 TAG = "MEMORYBANK"
 USER_ID_PREFIX = "memorybank"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
-CHUNK_SIZE = 300
-CHUNK_OVERLAP = 50
 _ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 STORE_ROOT = os.environ.get(
     "MEMORYBANK_STORE_ROOT",
     os.path.join(_ROOT_DIR, "log", "memorybank"),
 )
-
-_SPLIT_SEPARATORS = ["\n\n", "\n", ". ", " "]
 
 
 def _resolve_embedding_api_key(args) -> Optional[str]:
@@ -87,54 +82,9 @@ def _user_store_dir(user_id: str, store_root: str = STORE_ROOT) -> str:
     return os.path.join(store_root, f"user_{user_id}")
 
 
-def _stable_hash(text: str) -> int:
-    digest = hashlib.md5(text.encode("utf-8")).hexdigest()
-    return int(digest[:16], 16)
-
-
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, mode=0o700, exist_ok=True)
 
-
-def _split_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> List[str]:
-    if len(text) <= chunk_size:
-        return [text] if text.strip() else []
-
-    for sep in _SPLIT_SEPARATORS:
-        if sep in text:
-            parts = text.split(sep)
-            chunks: List[str] = []
-            current = ""
-            for part in parts:
-                candidate = f"{current}{sep}{part}" if current else part
-                if len(candidate) <= chunk_size:
-                    current = candidate
-                else:
-                    if current.strip():
-                        chunks.append(current)
-                    if len(part) > chunk_size:
-                        start = 0
-                        while start < len(part):
-                            end = start + chunk_size
-                            chunk = part[start:end]
-                            if chunk.strip():
-                                chunks.append(chunk)
-                            start += chunk_size - chunk_overlap
-                    else:
-                        current = part
-            if current.strip():
-                chunks.append(current)
-            return chunks
-
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        if chunk.strip():
-            chunks.append(chunk)
-        start += chunk_size - chunk_overlap
-    return chunks
 
 
 def _l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -174,8 +124,10 @@ class MemoryBankClient:
         self.reference_date = reference_date
 
         self._embedding_dim: Optional[int] = None
-        self._indices: Dict[str, faiss.IndexFlatIP] = {}
+        self._indices: Dict[str, faiss.IndexIDMap] = {}
         self._metadata: Dict[str, List[dict]] = {}
+        self._next_id: Dict[str, int] = {}
+        self._rng = random.Random(seed)
 
         self._embed_client = _openai.OpenAI(
             base_url=embedding_api_base,
@@ -218,7 +170,7 @@ class MemoryBankClient:
 
         return vectors
 
-    def _get_or_create_index(self, user_id: str) -> Tuple[faiss.IndexFlatIP, List[dict]]:
+    def _get_or_create_index(self, user_id: str) -> Tuple[faiss.IndexIDMap, List[dict]]:
         if user_id in self._indices:
             return self._indices[user_id], self._metadata[user_id]
 
@@ -228,16 +180,55 @@ class MemoryBankClient:
 
         if os.path.isfile(index_path) and os.path.isfile(meta_path):
             index = faiss.read_index(index_path)
+            if not isinstance(index, faiss.IndexIDMap):
+                dim = index.d
+                new_index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
+                n = index.ntotal
+                if n > 0:
+                    all_vecs = np.zeros((n, dim), dtype=np.float32)
+                    for i in range(n):
+                        all_vecs[i] = index.reconstruct(i)
+                    ids = np.arange(n, dtype=np.int64)
+                    new_index.add_with_ids(all_vecs, ids)
+                index = new_index
             with open(meta_path, "r", encoding="utf-8") as f:
                 metadata = json.load(f)
+            for i, meta in enumerate(metadata):
+                if "faiss_id" not in meta:
+                    meta["faiss_id"] = i
+            self._next_id[user_id] = max(
+                (m["faiss_id"] for m in metadata), default=-1
+            ) + 1
         else:
             dim = self._embedding_dim or 1536
-            index = faiss.IndexFlatIP(dim)
+            index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
             metadata = []
+            self._next_id[user_id] = 0
 
         self._indices[user_id] = index
         self._metadata[user_id] = metadata
         return index, metadata
+
+    def _alloc_id(self, user_id: str) -> int:
+        fid = self._next_id.get(user_id, 0)
+        self._next_id[user_id] = fid + 1
+        return fid
+
+    def _add_vector(self, user_id: str, text: str, embedding: List[float], timestamp: str, extra_meta: Optional[dict] = None) -> None:
+        index, metadata = self._get_or_create_index(user_id)
+        fid = self._alloc_id(user_id)
+        vec = np.array([embedding], dtype=np.float32)
+        index.add_with_ids(vec, np.array([fid], dtype=np.int64))
+        meta_entry = {
+            "text": text,
+            "timestamp": timestamp,
+            "memory_strength": 1,
+            "last_recall_date": timestamp[:10] if len(timestamp) >= 10 else timestamp,
+            "faiss_id": fid,
+        }
+        if extra_meta:
+            meta_entry.update(extra_meta)
+        metadata.append(meta_entry)
 
     def save_index(self, user_id: str) -> None:
         if user_id not in self._indices:
@@ -251,60 +242,43 @@ class MemoryBankClient:
             json.dump(self._metadata[user_id], f, ensure_ascii=False, indent=2)
 
     def add(self, messages: List[dict], user_id: str, timestamp: str) -> None:
-        all_chunks: List[str] = []
+        lines: List[str] = []
         for msg in messages:
             content = msg.get("content", "")
-            if not content.strip():
-                continue
-            chunks = _split_text(content)
-            all_chunks.extend(chunks)
+            for line in content.split("\n"):
+                stripped = line.strip()
+                if stripped:
+                    lines.append(stripped)
 
-        if not all_chunks:
+        if not lines:
             return
 
-        embeddings = self._get_embeddings(all_chunks)
+        embeddings = self._get_embeddings(lines)
 
-        index, metadata = self._get_or_create_index(user_id)
-
-        for i, (chunk, emb) in enumerate(zip(all_chunks, embeddings)):
-            vec = np.array([emb], dtype=np.float32)
-            index.add(vec)
-            meta_entry = {
-                "text": chunk,
-                "timestamp": timestamp,
-                "memory_strength": 1,
-                "last_recall_date": timestamp[:10] if len(timestamp) >= 10 else timestamp,
-            }
-            metadata.append(meta_entry)
-
-        if self.enable_summary and self._llm_client and all_chunks:
-            full_text = " ".join(all_chunks)
-            summary = self._summarize(full_text)
-            if summary:
-                summary_emb = self._get_embeddings([summary])[0]
-                vec = np.array([summary_emb], dtype=np.float32)
-                index.add(vec)
-                metadata.append({
-                    "text": summary,
-                    "timestamp": timestamp,
-                    "memory_strength": 1,
-                    "last_recall_date": timestamp[:10] if len(timestamp) >= 10 else timestamp,
-                })
-
-        self._indices[user_id] = index
-        self._metadata[user_id] = metadata
+        for line, emb in zip(lines, embeddings, strict=True):
+            self._add_vector(user_id, line, emb, timestamp)
 
     def _summarize(self, text: str) -> str:
+        if not self._llm_client:
+            return ""
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 resp = self._llm_client.chat.completions.create(
                     model=self._llm_model,
                     messages=[
-                        {"role": "system", "content": "Summarize the following text concisely."},
+                        {
+                            "role": "system",
+                            "content": (
+                                "Summarize the following conversation concisely, "
+                                "extracting user preferences, conditions, and specific values "
+                                "(e.g., temperature settings, seat positions, color choices). "
+                                "Organize by topic."
+                            ),
+                        },
                         {"role": "user", "content": text},
                     ],
-                    max_tokens=200,
+                    max_tokens=400,
                     temperature=0.3,
                 )
                 return resp.choices[0].message.content.strip()
@@ -314,30 +288,78 @@ class MemoryBankClient:
                 else:
                     return ""
 
+    def _generate_daily_summaries(self, user_id: str) -> None:
+        if not self._llm_client:
+            return
+
+        metadata = self._metadata.get(user_id, [])
+        daily_texts: Dict[str, List[str]] = {}
+        for meta in metadata:
+            if meta.get("type") in ("daily_summary", "overall_summary"):
+                continue
+            date_key = meta.get("timestamp", "")[:10]
+            if not date_key:
+                continue
+            daily_texts.setdefault(date_key, []).append(meta["text"])
+
+        for date_key, texts in sorted(daily_texts.items()):
+            combined = "\n".join(texts)
+            summary = self._summarize(combined)
+            if summary:
+                ts = f"{date_key}T00:00:00"
+                summary_emb = self._get_embeddings([summary])[0]
+                self._add_vector(user_id, summary, summary_emb, ts, {"type": "daily_summary"})
+
+    def _generate_overall_summary(self, user_id: str) -> None:
+        if not self._llm_client:
+            return
+
+        metadata = self._metadata.get(user_id, [])
+        daily_summaries = [
+            m["text"] for m in metadata if m.get("type") == "daily_summary"
+        ]
+        if not daily_summaries:
+            return
+
+        combined = "\n\n".join(daily_summaries)
+        summary = self._summarize(combined)
+        if summary:
+            ts = metadata[-1]["timestamp"] if metadata else datetime.now().isoformat()
+            summary_emb = self._get_embeddings([summary])[0]
+            self._add_vector(user_id, summary, summary_emb, ts, {"type": "overall_summary"})
+
     def _forgetting_retention(self, days_elapsed: float, memory_strength: int) -> float:
         return math.exp(-days_elapsed / (5 * memory_strength))
 
-    def _apply_forgetting(
-        self, candidates: List[dict], reference_date: str, user_id: str
-    ) -> List[dict]:
-        seed = self.seed if self.seed is not None else _stable_hash(user_id)
-        rng = random.Random(seed)
+    def _forget_at_ingestion(self, user_id: str) -> None:
+        if not self.enable_forgetting or not self.reference_date:
+            return
 
-        ref_dt = datetime.strptime(reference_date[:10], "%Y-%m-%d")
-        kept = []
-        for candidate in candidates:
-            ts_str = candidate.get("last_recall_date", candidate.get("timestamp", ""))[:10]
+        index, metadata = self._get_or_create_index(user_id)
+
+        ref_dt = datetime.strptime(self.reference_date[:10], "%Y-%m-%d")
+        ids_to_remove: List[int] = []
+        indices_to_keep: List[int] = []
+
+        for i, meta in enumerate(metadata):
+            ts_str = meta.get("last_recall_date", meta.get("timestamp", ""))[:10]
             try:
                 mem_dt = datetime.strptime(ts_str, "%Y-%m-%d")
             except ValueError:
-                kept.append(candidate)
+                indices_to_keep.append(i)
                 continue
             days_elapsed = (ref_dt - mem_dt).days
-            strength = candidate.get("memory_strength", 1)
+            strength = meta.get("memory_strength", 1)
             retention = self._forgetting_retention(days_elapsed, strength)
-            if rng.random() <= retention:
-                kept.append(candidate)
-        return kept
+            if self._rng.random() > retention:
+                ids_to_remove.append(meta["faiss_id"])
+            else:
+                indices_to_keep.append(i)
+
+        if ids_to_remove:
+            index.remove_ids(np.array(ids_to_remove, dtype=np.int64))
+            self._metadata[user_id] = [metadata[i] for i in indices_to_keep]
+            self._indices[user_id] = index
 
     def search(self, query: str, user_id: str, top_k: int = 5) -> List[dict]:
         index, metadata = self._get_or_create_index(user_id)
@@ -348,29 +370,27 @@ class MemoryBankClient:
         query_emb = self._get_embeddings([query])[0]
         query_vec = np.array([query_emb], dtype=np.float32)
 
-        oversample = min(top_k * 2, index.ntotal)
-        scores, indices = index.search(query_vec, oversample)
+        k = min(top_k, index.ntotal)
+        scores, indices = index.search(query_vec, k)
 
-        candidates = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0 or idx >= len(metadata):
+        id_to_meta = {m["faiss_id"]: i for i, m in enumerate(metadata)}
+
+        results: List[dict] = []
+        for score, faiss_id in zip(scores[0], indices[0]):
+            meta_idx = id_to_meta.get(int(faiss_id))
+            if meta_idx is None:
                 continue
-            meta = dict(metadata[idx])
+            meta = dict(metadata[meta_idx])
             meta["score"] = float(score)
-            meta["_orig_idx"] = int(idx)
-            candidates.append(meta)
-
-        if self.enable_forgetting and self.reference_date:
-            candidates = self._apply_forgetting(candidates, self.reference_date, user_id)
-
-        results = candidates[:top_k]
+            meta["_meta_idx"] = meta_idx
+            results.append(meta)
 
         for r in results:
-            orig_idx = r.pop("_orig_idx", None)
-            if orig_idx is not None and 0 <= orig_idx < len(metadata):
-                metadata[orig_idx]["memory_strength"] = metadata[orig_idx].get("memory_strength", 1) + 1
+            meta_idx = r.pop("_meta_idx", None)
+            if meta_idx is not None and 0 <= meta_idx < len(metadata):
+                metadata[meta_idx]["memory_strength"] = metadata[meta_idx].get("memory_strength", 1) + 1
                 if self.reference_date:
-                    metadata[orig_idx]["last_recall_date"] = self.reference_date[:10]
+                    metadata[meta_idx]["last_recall_date"] = self.reference_date[:10]
 
         return results
 
@@ -467,6 +487,13 @@ def run_add(args) -> None:
                 messages = [{"role": "user", "content": "\n".join(bucket.lines)}]
                 client.add(messages=messages, user_id=user_id, timestamp=ts)
                 message_count += len(bucket.lines)
+
+            if _resolve_enable_summary():
+                client._generate_daily_summaries(user_id)
+                client._generate_overall_summary(user_id)
+
+            client._forget_at_ingestion(user_id)
+
             client.save_index(user_id)
             return idx, message_count, None
         except Exception as exc:
