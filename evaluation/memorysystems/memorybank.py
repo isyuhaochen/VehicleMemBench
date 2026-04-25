@@ -139,20 +139,20 @@ def _strip_source_prefix(text: str, date_part: str) -> str:
     return text
 
 
-def _separate_list(ls: List[int]) -> List[List[int]]:
+def _group_consecutive(indices: List[int]) -> List[List[int]]:
     """将整数列表按连续性拆分为若干子列表。"""
-    if not ls:
+    if not indices:
         return []
-    lists: List[List[int]] = []
-    ls1 = [ls[0]]
-    for i in range(1, len(ls)):
-        if ls[i - 1] + 1 == ls[i]:
-            ls1.append(ls[i])
+    result: List[List[int]] = []
+    current = [indices[0]]
+    for i in range(1, len(indices)):
+        if indices[i - 1] + 1 == indices[i]:
+            current.append(indices[i])
         else:
-            lists.append(ls1)
-            ls1 = [ls[i]]
-    lists.append(ls1)
-    return lists
+            result.append(current)
+            current = [indices[i]]
+    result.append(current)
+    return result
 
 
 def _split_by_source(indices: List[int], metadata: List[dict]) -> List[List[int]]:
@@ -207,7 +207,7 @@ class MemoryBankClient:
 
         self._extra_metadata: Dict[str, dict] = {}
 
-        self._embed_client = _openai.OpenAI(
+        self._embedding_client = _openai.OpenAI(
             base_url=embedding_api_base,
             api_key=embedding_api_key,
         )
@@ -226,7 +226,7 @@ class MemoryBankClient:
         resp = None
         for attempt in range(max_retries):
             try:
-                resp = self._embed_client.embeddings.create(
+                resp = self._embedding_client.embeddings.create(
                     input=texts,
                     model=self.embedding_model,
                 )
@@ -265,9 +265,7 @@ class MemoryBankClient:
                 new_index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
                 n = index.ntotal
                 if n > 0:
-                    all_vecs = np.zeros((n, dim), dtype=np.float32)
-                    for i in range(n):
-                        all_vecs[i] = index.reconstruct(i)
+                    all_vecs = index.reconstruct_n(0, n)
                     ids = np.arange(n, dtype=np.int64)
                     new_index.add_with_ids(all_vecs, ids)
                 index = new_index
@@ -292,24 +290,24 @@ class MemoryBankClient:
         self._metadata[user_id] = metadata
         return index, metadata
 
-    def _alloc_id(self, user_id: str) -> int:
+    def _allocate_id(self, user_id: str) -> int:
         """为指定用户分配一个递增的 FAISS 向量 ID。"""
-        fid = self._next_id.get(user_id, 0)
-        self._next_id[user_id] = fid + 1
-        return fid
+        vector_id = self._next_id.get(user_id, 0)
+        self._next_id[user_id] = vector_id + 1
+        return vector_id
 
     def _add_vector(self, user_id: str, text: str, embedding: List[float], timestamp: str, extra_meta: Optional[dict] = None) -> None:
         """向用户索引中添加一条向量记录及对应元数据。"""
         index, metadata = self._get_or_create_index(user_id)
-        fid = self._alloc_id(user_id)
+        vector_id = self._allocate_id(user_id)
         vec = np.array([embedding], dtype=np.float32)
-        index.add_with_ids(vec, np.array([fid], dtype=np.int64))
+        index.add_with_ids(vec, np.array([vector_id], dtype=np.int64))
         meta_entry = {
             "text": text,
             "timestamp": timestamp,
             "memory_strength": 1,
             "last_recall_date": timestamp[:10] if len(timestamp) >= 10 else timestamp,
-            "faiss_id": fid,
+            "faiss_id": vector_id,
         }
         if extra_meta:
             meta_entry.update(extra_meta)
@@ -335,9 +333,9 @@ class MemoryBankClient:
         for r, meta_idx in indexed:
             score = float(r.get("score", 0.0))
             source = r.get("source", "")
-            docs_len = len(metadata[meta_idx].get("text", ""))
+            total_length = len(metadata[meta_idx].get("text", ""))
 
-            local_ids: List[int] = [meta_idx]
+            neighbor_indices: List[int] = [meta_idx]
 
             forward_ok = True
             backward_ok = True
@@ -355,11 +353,11 @@ class MemoryBankClient:
                         forward_ok = False
                     else:
                         neighbor_text = metadata[neighbor_pos].get("text", "")
-                        if docs_len + len(neighbor_text) > CHUNK_SIZE:
+                        if total_length + len(neighbor_text) > CHUNK_SIZE:
                             forward_ok = False
                         else:
-                            docs_len += len(neighbor_text)
-                            local_ids.append(neighbor_pos)
+                            total_length += len(neighbor_text)
+                            neighbor_indices.append(neighbor_pos)
 
                 if backward_ok:
                     neighbor_pos = meta_idx - offset
@@ -369,14 +367,14 @@ class MemoryBankClient:
                         backward_ok = False
                     else:
                         neighbor_text = metadata[neighbor_pos].get("text", "")
-                        if docs_len + len(neighbor_text) > CHUNK_SIZE:
+                        if total_length + len(neighbor_text) > CHUNK_SIZE:
                             backward_ok = False
                         else:
-                            docs_len += len(neighbor_text)
-                            local_ids.append(neighbor_pos)
+                            total_length += len(neighbor_text)
+                            neighbor_indices.append(neighbor_pos)
 
-            sorted_local = sorted(local_ids)
-            contiguous_groups = _separate_list(sorted_local)
+            sorted_local = sorted(neighbor_indices)
+            contiguous_groups = _group_consecutive(sorted_local)
 
             for contiguous in contiguous_groups:
                 same_source_groups = _split_by_source(contiguous, metadata)
@@ -385,7 +383,7 @@ class MemoryBankClient:
                     if not new_indices:
                         continue
 
-                    for run in _separate_list(new_indices):
+                    for run in _group_consecutive(new_indices):
                         for i in run:
                             seen_indices.add(i)
 
@@ -393,8 +391,8 @@ class MemoryBankClient:
                         for i in run:
                             t = metadata[i].get("text", "")
                             src = metadata[i].get("source", "")
-                            dp = src.removeprefix("summary_")
-                            t = _strip_source_prefix(t, dp)
+                            date_part = src.removeprefix("summary_")
+                            t = _strip_source_prefix(t, date_part)
                             parts.append(t.strip())
                         combined_text = "; ".join(parts)
                         base_meta = dict(metadata[run[0]])
@@ -450,7 +448,7 @@ class MemoryBankClient:
         if not all_entries:
             return
 
-        formatted_pairs: List[str] = []
+        pair_texts: List[str] = []
         for i in range(0, len(all_entries), 2):
             speaker_a, text_a = all_entries[i]
             if i + 1 < len(all_entries):
@@ -465,11 +463,11 @@ class MemoryBankClient:
                     f"Conversation content on {date_key}:"
                     f"[|{speaker_a}|]: {text_a}"
                 )
-            formatted_pairs.append(formatted)
+            pair_texts.append(formatted)
 
-        embeddings = self._get_embeddings(formatted_pairs)
+        embeddings = self._get_embeddings(pair_texts)
 
-        for text, emb in zip(formatted_pairs, embeddings, strict=True):
+        for text, emb in zip(pair_texts, embeddings, strict=True):
             self._add_vector(
                 user_id, text, emb, timestamp,
                 extra_meta={"source": date_key},
@@ -775,7 +773,7 @@ def validate_test_args(args) -> None:
 _warned_llm_fallback = False
 
 
-def _resolve_llm_creds(
+def _resolve_llm_credentials(
     args: Any,
     api_base: str,
     api_key: str,
@@ -826,7 +824,7 @@ def _build_client(args, user_id: str = "") -> MemoryBankClient:
     seed = _resolve_seed()
     reference_date = _resolve_reference_date()
 
-    llm_api_base, llm_api_key = _resolve_llm_creds(args, api_base, api_key)
+    llm_api_base, llm_api_key = _resolve_llm_credentials(args, api_base, api_key)
     llm_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
 
     return MemoryBankClient(
