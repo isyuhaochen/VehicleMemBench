@@ -558,7 +558,8 @@ class MemoryBankClient:
             daily_texts.setdefault(date_key, []).append(meta["text"])
 
         for date_key, texts in sorted(daily_texts.items()):
-            combined = "\n".join(texts)
+            cleaned = [_strip_source_prefix(t, date_key).strip() for t in texts]
+            combined = "\n".join(cleaned)
             summary = self._summarize(combined)
             if summary:
                 summary_text = (
@@ -635,7 +636,8 @@ class MemoryBankClient:
         personalities = extra.setdefault("daily_personalities", {})
 
         for date_key, texts in sorted(daily_texts.items()):
-            combined = "\n".join(texts)
+            cleaned = [_strip_source_prefix(t, date_key).strip() for t in texts]
+            combined = "\n".join(cleaned)
             personality = self._analyze_personality(combined)
             if personality:
                 personalities[date_key] = personality
@@ -882,11 +884,19 @@ def run_add(args) -> None:
             shutil.rmtree(store_dir)
         try:
             message_count = 0
+            daily_lines: Dict[str, List[str]] = {}
             for bucket in load_hourly_history(history_path):
-                ts = bucket.dt.isoformat() if bucket.dt else datetime.now().isoformat()
-                messages = [{"role": "user", "content": "\n".join(bucket.lines)}]
+                if bucket.dt:
+                    day_key = bucket.dt.strftime("%Y-%m-%d")
+                else:
+                    day_key = datetime.now().strftime("%Y-%m-%d")
+                daily_lines.setdefault(day_key, []).extend(bucket.lines)
+
+            for day_key, lines in sorted(daily_lines.items()):
+                ts = f"{day_key}T00:00:00"
+                messages = [{"role": "user", "content": "\n".join(lines)}]
                 client.add(messages=messages, user_id=user_id, timestamp=ts)
-                message_count += len(bucket.lines)
+                message_count += len(lines)
 
             if _resolve_enable_summary():
                 client._generate_daily_summaries(user_id)
