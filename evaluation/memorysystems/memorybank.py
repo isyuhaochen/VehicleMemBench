@@ -474,10 +474,11 @@ class MemoryBankClient:
             )
 
     def _call_llm(self, last_user_content: str) -> str:
-        """调用 LLM 生成回复，带重试逻辑处理可恢复的 API 错误。"""
+        """调用 LLM 生成回复，带重试逻辑处理可恢复的 API 错误和上下文长度回退。"""
         if not self._llm_client:
             return ""
         max_retries = 3
+        content = last_user_content
         for attempt in range(max_retries):
             try:
                 resp = self._llm_client.chat.completions.create(
@@ -499,7 +500,7 @@ class MemoryBankClient:
                             "role": "system",
                             "content": "Sure, I will do my best to assist you.",
                         },
-                        {"role": "user", "content": last_user_content},
+                        {"role": "user", "content": content},
                     ],
                     max_tokens=400,
                     temperature=0.7,
@@ -510,6 +511,25 @@ class MemoryBankClient:
                 return resp.choices[0].message.content.strip()
             except Exception as exc:
                 import openai as _openai_exc
+
+                context_exceeded = any(
+                    pattern in str(exc).lower()
+                    for pattern in (
+                        "maximum context",
+                        "context length",
+                        "too long",
+                        "reduce the length",
+                    )
+                )
+                if context_exceeded and attempt < max_retries - 1:
+                    cut_length = max(1800 - 200 * attempt, 500)
+                    logger.warning(
+                        "MemoryBank _call_llm context length exceeded, "
+                        "trimming to last %d chars (attempt %d/%d)",
+                        cut_length, attempt + 1, max_retries,
+                    )
+                    content = content[-cut_length:]
+                    continue
 
                 retryable = isinstance(exc, (
                     _openai_exc.APIConnectionError,
@@ -526,7 +546,7 @@ class MemoryBankClient:
                 if not retryable:
                     raise
 
-                logger.error(
+                logger.warning(
                     "MemoryBank _call_llm failed after %d retries: %s",
                     max_retries, exc,
                 )
@@ -548,12 +568,17 @@ class MemoryBankClient:
             return
 
         metadata = self._metadata.get(user_id, [])
+        existing_summary_dates = {
+            (m.get("source") or "").removeprefix("summary_")
+            for m in metadata
+            if m.get("type") == "daily_summary"
+        }
         daily_texts: Dict[str, List[str]] = {}
         for meta in metadata:
             if meta.get("type") == "daily_summary":
                 continue
             date_key = meta.get("source", meta.get("timestamp", "")[:10])
-            if not date_key:
+            if not date_key or date_key in existing_summary_dates:
                 continue
             daily_texts.setdefault(date_key, []).append(meta["text"])
 
@@ -623,24 +648,23 @@ class MemoryBankClient:
             return
 
         metadata = self._metadata.get(user_id, [])
+        extra = self._extra_metadata.setdefault(user_id, {})
+        existing_personalities = extra.setdefault("daily_personalities", {})
         daily_texts: Dict[str, List[str]] = {}
         for meta in metadata:
-            if meta.get("type") in ("daily_summary",):
+            if meta.get("type") == "daily_summary":
                 continue
             date_key = meta.get("source", meta.get("timestamp", "")[:10])
-            if not date_key:
+            if not date_key or date_key in existing_personalities:
                 continue
             daily_texts.setdefault(date_key, []).append(meta["text"])
-
-        extra = self._extra_metadata.setdefault(user_id, {})
-        personalities = extra.setdefault("daily_personalities", {})
 
         for date_key, texts in sorted(daily_texts.items()):
             cleaned = [_strip_source_prefix(t, date_key).strip() for t in texts]
             combined = "\n".join(cleaned)
             personality = self._analyze_personality(combined)
             if personality:
-                personalities[date_key] = personality
+                existing_personalities[date_key] = personality
 
     def _generate_overall_personality(self, user_id: str) -> None:
         """基于每日性格分析生成整体性格画像，存入额外元数据。"""
