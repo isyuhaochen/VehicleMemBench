@@ -31,6 +31,7 @@ MEMORY_SKIP_TYPES = frozenset({"daily_summary"})
 
 
 def _resolve_chunk_size() -> int:
+    """从环境变量 MEMORYBANK_CHUNK_SIZE 解析分块大小。"""
     raw = os.getenv("MEMORYBANK_CHUNK_SIZE")
     if raw is not None:
         try:
@@ -61,27 +62,17 @@ STORE_ROOT = os.environ.get(
 
 
 def _resolve_embedding_api_key(args) -> Optional[str]:
-    direct = getattr(args, "embedding_api_key", None)
-    if direct:
-        return direct
-    return resolve_memory_key(args, "EMBEDDING_API_KEY")
+    """获取 Embedding API 密钥，优先使用命令行参数，回退到环境变量。"""
+    return getattr(args, "embedding_api_key", None) or resolve_memory_key(args, "EMBEDDING_API_KEY")
 
 
 def _resolve_embedding_api_base(args) -> Optional[str]:
-    direct = getattr(args, "embedding_api_base", None)
-    if direct:
-        return direct
-    return resolve_memory_url(args, "EMBEDDING_API_BASE")
-
-
-def _resolve_embedding_model(args) -> str:
-    direct = getattr(args, "embedding_model", None)
-    if direct:
-        return direct
-    return os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+    """获取 Embedding API 基础 URL，优先使用命令行参数，回退到环境变量。"""
+    return getattr(args, "embedding_api_base", None) or resolve_memory_url(args, "EMBEDDING_API_BASE")
 
 
 def _resolve_reference_date() -> Optional[str]:
+    """从环境变量 MEMORYBANK_REFERENCE_DATE 读取参考日期。"""
     return os.getenv("MEMORYBANK_REFERENCE_DATE")
 
 
@@ -90,6 +81,7 @@ _FALSY_TOKENS = frozenset({"0", "false", "no", "off", "n"})
 
 
 def _resolve_bool_env(name: str, default: bool) -> bool:
+    """从环境变量解析布尔值，支持常见 truthy/falsy 词元。"""
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return default
@@ -107,14 +99,12 @@ def _resolve_bool_env(name: str, default: bool) -> bool:
 
 
 def _resolve_enable_summary() -> bool:
+    """从环境变量 MEMORYBANK_ENABLE_SUMMARY 读取是否启用摘要生成。"""
     return _resolve_bool_env("MEMORYBANK_ENABLE_SUMMARY", True)
 
 
-def _resolve_disable_forgetting() -> bool:
-    return _resolve_bool_env("MEMORYBANK_DISABLE_FORGETTING", True)
-
-
 def _resolve_seed() -> Optional[int]:
+    """从环境变量 MEMORYBANK_SEED 读取随机种子。"""
     raw = os.getenv("MEMORYBANK_SEED")
     if raw is not None:
         try:
@@ -129,18 +119,28 @@ def _resolve_seed() -> Optional[int]:
 
 
 def _resolve_store_root(args) -> str:
+    """获取存储根目录，优先使用命令行参数，回退到环境变量或默认值。"""
     return getattr(args, "store_root", None) or STORE_ROOT
 
 
 def _user_store_dir(user_id: str, store_root: str = STORE_ROOT) -> str:
+    """返回指定用户的存储目录路径。"""
     return os.path.join(store_root, f"user_{user_id}")
 
 
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, mode=0o700, exist_ok=True)
+def _strip_source_prefix(text: str, date_part: str) -> str:
+    """去除对话内容或摘要的前缀标记。"""
+    for pfx in (
+        f"Conversation content on {date_part}:",
+        f"The summary of the conversation on {date_part} is:",
+    ):
+        if text.startswith(pfx):
+            return text[len(pfx):]
+    return text
 
 
 def _separate_list(ls: List[int]) -> List[List[int]]:
+    """将整数列表按连续性拆分为若干子列表。"""
     if not ls:
         return []
     lists: List[List[int]] = []
@@ -156,6 +156,7 @@ def _separate_list(ls: List[int]) -> List[List[int]]:
 
 
 def _split_by_source(indices: List[int], metadata: List[dict]) -> List[List[int]]:
+    """将索引列表按 metadata 中的 source 字段分组。"""
     if not indices:
         return []
     groups: List[List[int]] = [[indices[0]]]
@@ -220,6 +221,7 @@ class MemoryBankClient:
             self._llm_model = llm_model or "gpt-4o-mini"
 
     def _get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """调用 Embedding API 将文本列表转为向量，带指数退避重试。"""
         max_retries = 5
         resp = None
         for attempt in range(max_retries):
@@ -247,6 +249,7 @@ class MemoryBankClient:
         return vectors
 
     def _get_or_create_index(self, user_id: str) -> Tuple[faiss.IndexIDMap, List[dict]]:
+        """获取或创建用户的 FAISS 索引和元数据列表，支持从磁盘加载已有索引。"""
         if user_id in self._indices:
             return self._indices[user_id], self._metadata[user_id]
 
@@ -290,11 +293,13 @@ class MemoryBankClient:
         return index, metadata
 
     def _alloc_id(self, user_id: str) -> int:
+        """为指定用户分配一个递增的 FAISS 向量 ID。"""
         fid = self._next_id.get(user_id, 0)
         self._next_id[user_id] = fid + 1
         return fid
 
     def _add_vector(self, user_id: str, text: str, embedding: List[float], timestamp: str, extra_meta: Optional[dict] = None) -> None:
+        """向用户索引中添加一条向量记录及对应元数据。"""
         index, metadata = self._get_or_create_index(user_id)
         fid = self._alloc_id(user_id)
         vec = np.array([embedding], dtype=np.float32)
@@ -311,6 +316,7 @@ class MemoryBankClient:
         metadata.append(meta_entry)
 
     def _merge_neighbors(self, results: List[dict], user_id: str) -> List[dict]:
+        """合并检索结果中来自同一来源的相邻条目，减少碎片化。"""
         if not results:
             return results
 
@@ -388,12 +394,7 @@ class MemoryBankClient:
                             t = metadata[i].get("text", "")
                             src = metadata[i].get("source", "")
                             dp = src.removeprefix("summary_")
-                            cpfx = f"Conversation content on {dp}:"
-                            spfx = f"The summary of the conversation on {dp} is:"
-                            if t.startswith(cpfx):
-                                t = t[len(cpfx):]
-                            elif t.startswith(spfx):
-                                t = t[len(spfx):]
+                            t = _strip_source_prefix(t, dp)
                             parts.append(t.strip())
                         combined_text = "; ".join(parts)
                         base_meta = dict(metadata[run[0]])
@@ -410,10 +411,11 @@ class MemoryBankClient:
         return merged_results
 
     def save_index(self, user_id: str) -> None:
+        """将用户的 FAISS 索引和元数据持久化到磁盘。"""
         if user_id not in self._indices:
             return
         store_dir = _user_store_dir(user_id, self._store_root)
-        _ensure_dir(store_dir)
+        os.makedirs(store_dir, mode=0o700, exist_ok=True)
         index_path = os.path.join(store_dir, "index.faiss")
         meta_path = os.path.join(store_dir, "metadata.json")
         extra_path = os.path.join(store_dir, "extra_metadata.json")
@@ -427,12 +429,14 @@ class MemoryBankClient:
 
     @staticmethod
     def _parse_speaker(line: str) -> Tuple[str, str]:
+        """从对话行中解析说话人和内容，格式为 "Speaker: content"。"""
         colon_pos = line.find(": ")
         if colon_pos > 0:
             return line[:colon_pos].strip(), line[colon_pos + 2:].strip()
         return "Speaker", line.strip()
 
     def add(self, messages: List[dict], user_id: str, timestamp: str) -> None:
+        """将对话消息分对编码为向量并存入用户索引。"""
         date_key = timestamp[:10] if len(timestamp) >= 10 else timestamp
         all_entries: List[Tuple[str, str]] = []
         for msg in messages:
@@ -472,6 +476,7 @@ class MemoryBankClient:
             )
 
     def _call_llm(self, last_user_content: str) -> str:
+        """调用 LLM 生成回复，带重试逻辑处理可恢复的 API 错误。"""
         if not self._llm_client:
             return ""
         max_retries = 3
@@ -530,6 +535,7 @@ class MemoryBankClient:
                 return ""
 
     def _summarize(self, text: str) -> str:
+        """调用 LLM 对对话文本生成摘要。"""
         return self._call_llm(
             "Please summarize the following dialogue as concisely as "
             "possible, extracting the main themes and key information. "
@@ -539,6 +545,7 @@ class MemoryBankClient:
         )
 
     def _generate_daily_summaries(self, user_id: str) -> None:
+        """按日期聚合对话内容并生成每日摘要向量。"""
         if not self._llm_client:
             return
 
@@ -565,6 +572,7 @@ class MemoryBankClient:
                                  {"type": "daily_summary", "source": f"summary_{date_key}"})
 
     def _generate_overall_summary(self, user_id: str) -> None:
+        """基于所有每日摘要生成整体摘要，存入额外元数据。"""
         if not self._llm_client:
             return
 
@@ -601,6 +609,7 @@ class MemoryBankClient:
             extra["overall_summary"] = summary
 
     def _analyze_personality(self, text: str) -> str:
+        """调用 LLM 分析对话中体现的用户性格特征和情绪。"""
         return self._call_llm(
             "Based on the following dialogue, please summarize the user's "
             "personality traits and emotions, and devise response strategies "
@@ -610,6 +619,7 @@ class MemoryBankClient:
         )
 
     def _generate_daily_personalities(self, user_id: str) -> None:
+        """按日期聚合对话并分析每日用户性格，存入额外元数据。"""
         if not self._llm_client:
             return
 
@@ -633,6 +643,7 @@ class MemoryBankClient:
                 personalities[date_key] = personality
 
     def _generate_overall_personality(self, user_id: str) -> None:
+        """基于每日性格分析生成整体性格画像，存入额外元数据。"""
         if not self._llm_client:
             return
 
@@ -661,9 +672,11 @@ class MemoryBankClient:
             extra["overall_personality"] = personality
 
     def _forgetting_retention(self, days_elapsed: float, memory_strength: int) -> float:
+        """基于艾宾浩斯遗忘曲线计算记忆保留概率。"""
         return math.exp(-days_elapsed / (5 * memory_strength))
 
     def _forget_at_ingestion(self, user_id: str) -> None:
+        """在数据摄入阶段根据遗忘曲线概率性地丢弃部分记忆。"""
         if not self.enable_forgetting or not self.reference_date:
             return
 
@@ -698,6 +711,7 @@ class MemoryBankClient:
             self._indices[user_id] = index
 
     def search(self, query: str, user_id: str, top_k: int = 5) -> List[dict]:
+        """基于向量相似度检索与查询最相关的记忆，并合并相邻条目。"""
         index, metadata = self._get_or_create_index(user_id)
 
         if index.ntotal == 0:
@@ -737,10 +751,12 @@ class MemoryBankClient:
         return merged
 
     def get_extra_metadata(self, user_id: str) -> dict:
+        """获取用户的额外元数据（整体摘要、性格画像等）。"""
         return self._extra_metadata.get(user_id, {})
 
 
 def validate_add_args(args) -> None:
+    """验证 add 操作所需的 Embedding API 凭据是否已提供。"""
     require_value(
         _resolve_embedding_api_key(args),
         "Embedding API key is required: pass --memory_key or set MEMORY_KEY/EMBEDDING_API_KEY",
@@ -752,6 +768,7 @@ def validate_add_args(args) -> None:
 
 
 def validate_test_args(args) -> None:
+    """验证测试操作所需参数，委托给 validate_add_args。"""
     validate_add_args(args)
 
 
@@ -763,6 +780,7 @@ def _resolve_llm_creds(
     api_base: str,
     api_key: str,
 ) -> Tuple[str, str]:
+    """解析 LLM API 凭据，缺失时回退到 Embedding API 凭据并记录警告。"""
     global _warned_llm_fallback
 
     explicit_base = resolve_memory_url(args, "LLM_API_BASE")
@@ -793,6 +811,7 @@ def _resolve_llm_creds(
 
 
 def _build_client(args, user_id: str = "") -> MemoryBankClient:
+    """根据命令行参数和环境变量构建 MemoryBankClient 实例。"""
     api_key = require_value(
         _resolve_embedding_api_key(args),
         "Embedding API key is required: pass --memory_key or set MEMORY_KEY/EMBEDDING_API_KEY",
@@ -802,7 +821,7 @@ def _build_client(args, user_id: str = "") -> MemoryBankClient:
         "Embedding API base URL is required: pass --memory_url or set MEMORY_URL/EMBEDDING_API_BASE",
     )
 
-    disable_forgetting = _resolve_disable_forgetting()
+    disable_forgetting = _resolve_bool_env("MEMORYBANK_DISABLE_FORGETTING", True)
     enable_summary = _resolve_enable_summary()
     seed = _resolve_seed()
     reference_date = _resolve_reference_date()
@@ -813,7 +832,7 @@ def _build_client(args, user_id: str = "") -> MemoryBankClient:
     return MemoryBankClient(
         embedding_api_base=api_base,
         embedding_api_key=api_key,
-        embedding_model=_resolve_embedding_model(args),
+        embedding_model=getattr(args, "embedding_model", None) or os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
         enable_forgetting=not disable_forgetting,
         enable_summary=enable_summary,
         seed=seed,
@@ -826,6 +845,7 @@ def _build_client(args, user_id: str = "") -> MemoryBankClient:
 
 
 def _compute_reference_date(history_dir: str, file_range: Optional[str]) -> str:
+    """扫描历史文件中的时间戳，计算最新日期的下一天作为参考日期。"""
     history_files = collect_history_files(history_dir, file_range)
     max_ts: Optional[datetime] = None
     for _, path in history_files:
@@ -840,6 +860,7 @@ def _compute_reference_date(history_dir: str, file_range: Optional[str]) -> str:
 
 
 def run_add(args) -> None:
+    """将对话历史摄入到 MemoryBank，构建向量索引并可选生成摘要和遗忘。"""
     validate_add_args(args)
     history_dir = os.path.abspath(args.history_dir)
     if not os.path.isdir(history_dir):
@@ -891,12 +912,14 @@ def run_add(args) -> None:
 
 
 def init_test_state(args, file_numbers, user_id_prefix):
+    """初始化测试状态（MemoryBank 不需要共享状态）。"""
     del file_numbers, user_id_prefix
     validate_test_args(args)
     return None
 
 
 def build_test_client(args, file_num: int, user_id_prefix: str, shared_state: Any):
+    """构建用于测试的 MemoryBank 客户端包装器。"""
     del shared_state
     client = _build_client(args)
     if not client.reference_date:
@@ -913,6 +936,7 @@ class _MemoryBankTestWrapper:
         self._user_id = user_id
 
     def search(self, query: str, user_id: Optional[str] = None, top_k: int = 5) -> List[dict]:
+        """检索记忆并附带整体摘要和性格画像。"""
         uid = user_id if user_id is not None else self._user_id
         results = list(self._client.search(query=query, user_id=uid, top_k=top_k))
 
@@ -942,14 +966,17 @@ class _MemoryBankTestWrapper:
 
 
 def close_test_state(shared_state: Any) -> None:
+    """清理测试状态（MemoryBank 无需清理）。"""
     del shared_state
 
 
 def is_test_sequential() -> bool:
+    """MemoryBank 测试支持并行执行。"""
     return False
 
 
 def format_search_results(search_result: Any) -> Tuple[str, int]:
+    """将检索结果格式化为带编号的文本，按日期分组并标注记忆强度。"""
     if not isinstance(search_result, list):
         return "", 0
     if not search_result:
@@ -966,12 +993,7 @@ def format_search_results(search_result: Any) -> Tuple[str, int]:
     for item in sorted_results:
         text = item.get("text", "")
         date_part = (item.get("source") or "").removeprefix("summary_")
-        conv_prefix = f"Conversation content on {date_part}:"
-        summary_prefix = f"The summary of the conversation on {date_part} is:"
-        if text.startswith(conv_prefix):
-            text = text[len(conv_prefix):].strip()
-        elif text.startswith(summary_prefix):
-            text = text[len(summary_prefix):].strip()
+        text = _strip_source_prefix(text, date_part).strip()
 
         if not groups or groups[-1][0] != date_part:
             groups.append((date_part, text, [item]))
