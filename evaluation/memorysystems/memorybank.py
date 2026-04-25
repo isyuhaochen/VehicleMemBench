@@ -24,7 +24,7 @@ TAG = "MEMORYBANK"
 USER_ID_PREFIX = "memorybank"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 CHUNK_SIZE = 200
-MEMORY_SKIP_TYPES = frozenset({"daily_summary", "overall_summary", "daily_personality", "overall_personality"})
+MEMORY_SKIP_TYPES = frozenset({"daily_summary"})
 _ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 STORE_ROOT = os.environ.get(
@@ -152,6 +152,8 @@ class MemoryBankClient:
         self._next_id: Dict[str, int] = {}
         self._rng = random.Random(seed)
 
+        self._extra_metadata: Dict[str, dict] = {}
+
         self._embed_client = _openai.OpenAI(
             base_url=embedding_api_base,
             api_key=embedding_api_key,
@@ -199,6 +201,7 @@ class MemoryBankClient:
         store_dir = _user_store_dir(user_id, self._store_root)
         index_path = os.path.join(store_dir, "index.faiss")
         meta_path = os.path.join(store_dir, "metadata.json")
+        extra_path = os.path.join(store_dir, "extra_metadata.json")
 
         if os.path.isfile(index_path) and os.path.isfile(meta_path):
             index = faiss.read_index(index_path)
@@ -221,6 +224,9 @@ class MemoryBankClient:
             self._next_id[user_id] = max(
                 (m["faiss_id"] for m in metadata), default=-1
             ) + 1
+            if os.path.isfile(extra_path):
+                with open(extra_path, "r", encoding="utf-8") as f:
+                    self._extra_metadata[user_id] = json.load(f)
         else:
             dim = self._embedding_dim or 1536
             index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
@@ -346,9 +352,14 @@ class MemoryBankClient:
         _ensure_dir(store_dir)
         index_path = os.path.join(store_dir, "index.faiss")
         meta_path = os.path.join(store_dir, "metadata.json")
+        extra_path = os.path.join(store_dir, "extra_metadata.json")
         faiss.write_index(self._indices[user_id], index_path)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(self._metadata[user_id], f, ensure_ascii=False, indent=2)
+        extra = self._extra_metadata.get(user_id, {})
+        if extra:
+            with open(extra_path, "w", encoding="utf-8") as f:
+                json.dump(extra, f, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _parse_speaker(line: str) -> Tuple[str, str]:
@@ -452,7 +463,7 @@ class MemoryBankClient:
         metadata = self._metadata.get(user_id, [])
         daily_texts: Dict[str, List[str]] = {}
         for meta in metadata:
-            if meta.get("type") in ("daily_summary", "overall_summary"):
+            if meta.get("type") == "daily_summary":
                 continue
             date_key = meta.get("source", meta.get("timestamp", "")[:10])
             if not date_key:
@@ -493,12 +504,10 @@ class MemoryBankClient:
             prompt += f"\nAt {date}, the events are {text.strip()}"
         prompt += "\nSummarization："
 
-        ts = metadata[-1]["timestamp"] if metadata else datetime.now().isoformat()
         summary = self._call_llm(prompt)
         if summary:
-            summary_emb = self._get_embeddings([summary])[0]
-            self._add_vector(user_id, summary, summary_emb, ts,
-                             {"type": "overall_summary", "source": "overall"})
+            extra = self._extra_metadata.setdefault(user_id, {})
+            extra["overall_summary"] = summary
 
     def _analyze_personality(self, text: str) -> str:
         return self._call_llm(
@@ -516,30 +525,28 @@ class MemoryBankClient:
         metadata = self._metadata.get(user_id, [])
         daily_texts: Dict[str, List[str]] = {}
         for meta in metadata:
-            if meta.get("type") in MEMORY_SKIP_TYPES:
+            if meta.get("type") in ("daily_summary",):
                 continue
             date_key = meta.get("source", meta.get("timestamp", "")[:10])
             if not date_key:
                 continue
             daily_texts.setdefault(date_key, []).append(meta["text"])
 
+        extra = self._extra_metadata.setdefault(user_id, {})
+        personalities = extra.setdefault("daily_personalities", {})
+
         for date_key, texts in sorted(daily_texts.items()):
             combined = "\n".join(texts)
             personality = self._analyze_personality(combined)
             if personality:
-                ts = f"{date_key}T00:00:00"
-                personality_emb = self._get_embeddings([personality])[0]
-                self._add_vector(user_id, personality, personality_emb, ts,
-                                 {"type": "daily_personality", "source": date_key})
+                personalities[date_key] = personality
 
     def _generate_overall_personality(self, user_id: str) -> None:
         if not self._llm_client:
             return
 
-        metadata = self._metadata.get(user_id, [])
-        daily_personalities = [
-            m for m in metadata if m.get("type") == "daily_personality"
-        ]
+        extra = self._extra_metadata.get(user_id, {})
+        daily_personalities = extra.get("daily_personalities", {})
         if not daily_personalities:
             return
 
@@ -548,21 +555,18 @@ class MemoryBankClient:
             "throughout multiple dialogues, along with appropriate response strategies "
             "for the current situation:\n"
         )
-        for m in daily_personalities:
-            date = m.get("source", m.get("timestamp", "")[:10])
-            prompt += f"\nAt {date}, the analysis shows {m['text'].strip()}"
+        for date, text in sorted(daily_personalities.items()):
+            prompt += f"\nAt {date}, the analysis shows {text.strip()}"
         prompt += (
             "\nPlease provide a highly concise and general summary of the user's "
             "personality and the most appropriate response strategy for the AI, "
             "summarized as:"
         )
 
-        ts = metadata[-1]["timestamp"] if metadata else datetime.now().isoformat()
         personality = self._call_llm(prompt)
         if personality:
-            personality_emb = self._get_embeddings([personality])[0]
-            self._add_vector(user_id, personality, personality_emb, ts,
-                             {"type": "overall_personality", "source": "overall"})
+            extra = self._extra_metadata.setdefault(user_id, {})
+            extra["overall_personality"] = personality
 
     def _forgetting_retention(self, days_elapsed: float, memory_strength: int) -> float:
         return math.exp(-days_elapsed / (5 * memory_strength))
