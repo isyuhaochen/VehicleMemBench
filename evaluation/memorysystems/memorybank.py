@@ -565,7 +565,7 @@ class MemoryBankClient:
                     f"The summary of the conversation on {date_key} is: {summary}"
                 )
                 ts = f"{date_key}T00:00:00"
-                summary_emb = self._get_embeddings([summary])[0]
+                summary_emb = self._get_embeddings([summary_text])[0]
                 self._add_vector(user_id, summary_text, summary_emb, ts,
                                  {"type": "daily_summary", "source": f"summary_{date_key}"})
 
