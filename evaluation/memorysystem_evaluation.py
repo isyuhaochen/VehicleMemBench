@@ -213,11 +213,11 @@ Rules:
                 if func_name == "search_memory":
                     memory_tool_calls.append({"name": func_name, "args": args})
                     search_query = args.get("query", query)
-                    top_k = args.get("top_k", 5)
+                    top_k = args.get("top_k", 3)
                     try:
                         top_k = int(top_k)
                     except Exception:
-                        top_k = 5
+                        top_k = 3
                     top_k = max(1, min(top_k, 20))
 
                     try:

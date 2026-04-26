@@ -53,7 +53,7 @@ USER_ID_PREFIX = "memorybank"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 # [DIFF] 原项目 CHUNK_SIZE=200，适配中文短对话（~80字符/对）。
 # 本测试集为英文长对话（平均 ~272 字符/对），200 会导致合并逻辑完全失效，
-# 因此改为 500 以保留与原项目等价的合并效果（合并 2-3 个邻居）。
+# 因此改为 500 以保留与原项目等价的合并效果（合并 1-2 个邻居）。
 DEFAULT_CHUNK_SIZE = 500
 MEMORY_SKIP_TYPES = frozenset({"daily_summary"})
 
@@ -314,9 +314,11 @@ class MemoryBankClient:
             index = faiss.read_index(index_path)
             if not isinstance(index, faiss.IndexIDMap):
                 dim = index.d
-                # [DIFF] 原项目使用 LangChain FAISS 封装（默认 IndexFlatL2）。
-                # 本实现改用原生 FAISS + IndexFlatIP（内积），配合 L2 归一化
-                # 等价于余弦相似度，更适合 OpenAI Embedding API 的场景。
+# [DIFF] 原项目使用 LangChain FAISS 封装（默认 IndexFlatL2，欧氏距离）。
+# 本实现改用原生 FAISS + IndexFlatIP（内积），配合 L2 归一化
+# 等价于余弦相似度。原项目所用 SentenceTransformer 同样针对余弦相似度
+# 优化（原版选用 L2 属 suboptimal），OpenAI Embedding API 亦是如此，
+# 因此使用 IP 在所有嵌入模型下均为更正确选择。
                 new_index = faiss.IndexIDMap(faiss.IndexFlatIP(dim))
                 n = index.ntotal
                 if n > 0:
@@ -778,9 +780,11 @@ class MemoryBankClient:
     def _forgetting_retention(self, days_elapsed: float, memory_strength: int) -> float:
         """基于艾宾浩斯遗忘曲线计算记忆保留概率。
 
-        [DIFF] 原项目公式为 `math.exp(-t / 5*S)`，因 Python 运算符优先级
-        实际计算为 `math.exp((-t/5) * S)`，导致 memory_strength 越大遗忘越多，
-        与艾宾浩斯曲线和代码注释的描述矛盾。此处修正为正确公式
+        [DIFF] 原项目公式为 `math.exp(-t / 5*S)`（forget_memory.py:36），
+        因 Python 运算符优先级实际计算为 `math.exp((-t/5) * S)`，
+        导致 memory_strength 越大遗忘越多——与该方法 docstring
+        "The higher the memory strength, the slower the rate of forgetting"
+        以及艾宾浩斯曲线定义矛盾。此处修正为正确公式
         `math.exp(-t / (5*S))`，使 strength 越大保留率越高。
         """
         return min(1.0, math.exp(-days_elapsed / (5 * memory_strength)))
@@ -820,7 +824,10 @@ class MemoryBankClient:
             self._metadata[user_id] = [metadata[i] for i in indices_to_keep]
             self._indices[user_id] = index
 
-    def search(self, query: str, user_id: str, top_k: int = 5) -> List[dict]:
+    # [DIFF] 原项目 VECTOR_SEARCH_TOP_K：ChatGLM/BELLE 路径=3，
+    # ChatGPT/LlamaIndex 路径=2（cli_llamaindex.py:36）。
+    # 本实现取 3 以更接近主流路径（local_doc_qa.py:15）。
+    def search(self, query: str, user_id: str, top_k: int = 3) -> List[dict]:
         """基于向量相似度检索与查询最相关的记忆，并合并相邻条目。"""
         index, metadata = self._get_or_create_index(user_id)
 
@@ -1064,7 +1071,7 @@ class _MemoryBankTestWrapper:
         self._client = client
         self._user_id = user_id
 
-    def search(self, query: str, user_id: Optional[str] = None, top_k: int = 5) -> List[dict]:
+    def search(self, query: str, user_id: Optional[str] = None, top_k: int = 3) -> List[dict]:
         """检索记忆并附带整体摘要和性格画像。"""
         uid = user_id if user_id is not None else self._user_id
         results = list(self._client.search(query=query, user_id=uid, top_k=top_k))
