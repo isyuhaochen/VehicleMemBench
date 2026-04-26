@@ -100,16 +100,24 @@ _TRUTHY_TOKENS = frozenset({"1", "true", "yes", "on", "y"})
 _FALSY_TOKENS = frozenset({"0", "false", "no", "off", "n"})
 
 
+def _parse_bool_token(raw: str) -> Optional[bool]:
+    """将非空字符串解析为布尔值，无法识别时返回 None。"""
+    normalized = raw.strip().lower()
+    if normalized in _TRUTHY_TOKENS:
+        return True
+    if normalized in _FALSY_TOKENS:
+        return False
+    return None
+
+
 def _resolve_bool_env(name: str, default: bool) -> bool:
     """从环境变量解析布尔值，支持常见 truthy/falsy 词元。"""
     value = os.getenv(name)
     if value is None or value.strip() == "":
         return default
-    normalized = value.strip().lower()
-    if normalized in _TRUTHY_TOKENS:
-        return True
-    if normalized in _FALSY_TOKENS:
-        return False
+    parsed = _parse_bool_token(value)
+    if parsed is not None:
+        return parsed
     logger.warning(
         "MemoryBank: env %s=%r not recognized as boolean "
         "(truthy: %s, falsy: %s); treating as False",
@@ -121,6 +129,35 @@ def _resolve_bool_env(name: str, default: bool) -> bool:
 def _resolve_enable_summary() -> bool:
     """从环境变量 MEMORYBANK_ENABLE_SUMMARY 读取是否启用摘要生成。"""
     return _resolve_bool_env("MEMORYBANK_ENABLE_SUMMARY", True)
+
+
+def _resolve_enable_forgetting() -> bool:
+    """从环境变量 MEMORYBANK_ENABLE_FORGETTING 读取是否启用遗忘机制。"""
+    # [DIFF] 原项目遗忘机制始终启用。本测评场景默认禁用，以保证结果可复现性。
+    # 需要启用时设置 MEMORYBANK_ENABLE_FORGETTING=1。
+    new_val = os.getenv("MEMORYBANK_ENABLE_FORGETTING")
+    if new_val is not None:
+        if new_val.strip():
+            parsed = _parse_bool_token(new_val)
+            if parsed is not None:
+                return parsed
+            logger.warning(
+                "MemoryBank: MEMORYBANK_ENABLE_FORGETTING=%r not recognized as boolean",
+                new_val,
+            )
+        return False
+    old_val = os.getenv("MEMORYBANK_DISABLE_FORGETTING")
+    if old_val is not None and old_val.strip():
+        logger.warning(
+            "MemoryBank: MEMORYBANK_DISABLE_FORGETTING is deprecated; "
+            "use MEMORYBANK_ENABLE_FORGETTING instead "
+            "(MEMORYBANK_DISABLE_FORGETTING=1 means enable_forgetting=False)"
+        )
+        parsed = _parse_bool_token(old_val)
+        if parsed is not None:
+            return not parsed
+        return False
+    return False
 
 
 def _resolve_seed() -> Optional[int]:
@@ -200,7 +237,7 @@ class MemoryBankClient:
         embedding_api_base: str,
         embedding_api_key: str,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-        enable_forgetting: bool = True,
+        enable_forgetting: bool = False,
         enable_summary: bool = False,
         seed: Optional[int] = None,
         reference_date: Optional[str] = None,
@@ -255,7 +292,7 @@ class MemoryBankClient:
                 break
             except Exception:
                 if attempt < max_retries - 1:
-                    jitter = random.random()
+                    jitter = self._rng.random()
                     time.sleep(2 ** attempt + jitter)
                 else:
                     raise
@@ -344,6 +381,9 @@ class MemoryBankClient:
 
     def _merge_neighbors(self, results: List[dict], user_id: str) -> List[dict]:
         """合并检索结果中来自同一来源的相邻条目，减少碎片化。"""
+        # [DIFF] 原项目 source=memory_id（每个对话独立，合并逻辑实际无效）。
+        # 本实现 source=date_key（同日期条目共享 source），使多用户对话中
+        # 同一日期的连续条目可被合并，检索文本更连贯。非连续的同日期条目不会合并。
         if not results:
             return results
 
@@ -504,6 +544,9 @@ class MemoryBankClient:
         for text, emb in zip(pair_texts, embeddings, strict=True):
             self._add_vector(
                 user_id, text, emb, timestamp,
+                # [DIFF] 原项目 source=memory_id（每个对话独立，如 f'{user}_{date}_{i}'），
+                # 导致合并逻辑实际无效。本实现 source=date_key（同日期共享），使同一日期的
+                # 连续条目可在 _merge_neighbors 中合并，检索结果更连贯。
                 extra_meta={"source": date_key},
             )
 
@@ -813,6 +856,9 @@ class MemoryBankClient:
                 metadata[mi]["memory_strength"] = metadata[mi].get("memory_strength", 1) + 1
                 if self.reference_date:
                     metadata[mi]["last_recall_date"] = self.reference_date[:10]
+        # [DIFF] 原项目 search 后仅更新 history 中对话条目的 memory_strength，
+        # 不更新 daily_summary 条目的强度。本实现对所有搜索结果均更新强度以保持
+        # 语义一致性；当前 summary 属于 MEMORY_SKIP_TYPES，故不影响遗忘行为。
 
         merged = self._merge_neighbors(results, user_id)
 
@@ -896,8 +942,8 @@ def _build_client(args, user_id: str = "") -> MemoryBankClient:
         "Embedding API base URL is required: pass --memory_url or set MEMORY_URL/EMBEDDING_API_BASE",
     )
 
-    disable_forgetting = _resolve_bool_env("MEMORYBANK_DISABLE_FORGETTING", True)
     enable_summary = _resolve_enable_summary()
+    enable_forgetting = _resolve_enable_forgetting()
     seed = _resolve_seed()
     reference_date = _resolve_reference_date()
 
@@ -908,7 +954,7 @@ def _build_client(args, user_id: str = "") -> MemoryBankClient:
         embedding_api_base=api_base,
         embedding_api_key=api_key,
         embedding_model=getattr(args, "embedding_model", None) or os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
-        enable_forgetting=not disable_forgetting,
+        enable_forgetting=enable_forgetting,
         enable_summary=enable_summary,
         seed=seed,
         reference_date=reference_date,
@@ -921,6 +967,9 @@ def _build_client(args, user_id: str = "") -> MemoryBankClient:
 
 def _compute_reference_date(history_dir: str, file_range: Optional[str]) -> str:
     """扫描历史文件中的时间戳，计算最新日期的下一天作为参考日期。"""
+    # [DIFF] 原项目使用 `datetime.date.today()` 作为参考日期，可能距最后对话
+    # 数周/数月（遗忘更激进）。本实现使用历史文件最新日期的下一天，使遗忘量
+    # 保持合理且结果可复现，适合测评场景。
     history_files = collect_history_files(history_dir, file_range)
     max_ts: Optional[datetime] = None
     for _, path in history_files:
